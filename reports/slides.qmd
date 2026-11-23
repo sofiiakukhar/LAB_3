@@ -1,0 +1,190 @@
+---
+title: "Основи регресійного моделювання"
+subtitle: "Прогнозування ринкової вартості житлової нерухомості у мегаполісах США"
+author: "Софія Кухар"
+date: today
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    transition: fade
+    width: 1280
+    height: 720
+    margin: 0.08
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(rsample)
+library(sandwich)
+library(lmtest)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 15))
+
+df_raw <- read_csv("../data/house_prices_large_dataset.csv", show_col_types = FALSE)
+
+df_clean <- df_raw |>
+  select(-House_ID, -Floor) |>
+  mutate(
+    Location = factor(Location),
+    Property_Type = factor(Property_Type)
+  )
+
+set.seed(42)
+data_split <- initial_split(df_clean, prop = 0.80)
+train_df <- training(data_split)
+test_df  <- testing(data_split)
+
+formula_base <- Price_USD ~ Area_sqft + Location + Property_Type +
+  Bedrooms + Bathrooms + Garage + Year_Built + Distance_to_CityCenter_km
+
+formula_inter <- Price_USD ~ Area_sqft * Location + Property_Type +
+  Bedrooms + Bathrooms + Garage + Year_Built + Distance_to_CityCenter_km
+
+fit_base  <- lm(formula_base, data = train_df)
+fit_inter <- lm(formula_inter, data = train_df)
+```
+
+## 1. Дослідницьке питання та гіпотези
+
+* **Предметна область:** ринок житлової нерухомості у 8 містах США ($N = 50\,000$).
+* **Одиниця та ціль:** окремий житловий об'єкт; цільова змінна — `Price_USD` (в USD).
+* **Головне питання:** *Як площа та місто визначають ціну житла і наскільки точно лінійна регресія прогнозує нові об'єкти?*
+* **Гіпотези (до оцінювання моделей):**
+  * **$H_1$ (конфірматорна, Rosen, 1974):** збільшення `Area_sqft` має додатний лінійний зв'язок із `Price_USD`.
+  * **$H_2$ (розвідувальна, Sirmans et al., 2005 + EDA):** вартість $1\text{ sq.ft}$ суттєво відрізняється між містами (`Area_sqft * Location`).
+
+---
+
+## 2. Дані, очищення та протокол валідації
+
+* **Аудит даних:** $50\,000$ об'єктів, без дублікатів; виключено `House_ID` та `Floor` ($74.9\%$ структурних пропусків — заповнена лише для квартир).
+* **Захист від витоку:** випадковий поділ **80% Train ($40\,000$) / 20% Test ($10\,000$)** (`seed = 42`) до EDA та навчання.
+* **Схема відбору:** **5-кратна крос-валідація (`5-fold CV`)** на навчальній частині.
+* **Основна метрика — MAE (USD):** стійка до гетероскедастичності у дорогому сегменті та прямо вимірює типову помилку в доларах.
+
+---
+
+## 3. Ключова знахідка EDA: ефект взаємодії
+
+```{r slide-eda-plot, fig.width=11, fig.height=4.8}
+set.seed(42)
+train_df |>
+  slice_sample(n = 3500) |>
+  ggplot(aes(x = Area_sqft, y = Price_USD / 1e6, color = Location)) +
+  geom_point(alpha = 0.25, size = 1.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.1) +
+  labs(
+    title = "Залежність ціни від площі за містами (Train)",
+    subtitle = "Кут нахилу відрізняється у >2 рази (від $200/sq.ft у Houston до $452/sq.ft у San Francisco)",
+    x = "Житлова площа, кв. футів (Area_sqft)",
+    y = "Ціна житла, млн USD",
+    color = "Місто"
+  )
+```
+
+---
+
+## 4. Діагностика базової моделі (OLS без взаємодії)
+
+```{r slide-diag-plot, fig.width=11, fig.height=4.5}
+set.seed(42)
+broom::augment(fit_base) |>
+  slice_sample(n = 3500) |>
+  ggplot(aes(x = .fitted / 1e6, y = .resid / 1e6)) +
+  geom_point(alpha = 0.25, color = "#2980b9") +
+  geom_hline(yintercept = 0, color = "#e74c3c", linetype = "dashed", linewidth = 1) +
+  geom_smooth(method = "loess", se = FALSE, color = "#f39c12", linewidth = 1.1) +
+  labs(
+    title = "Залишки проти прогнозів базової моделі (Base OLS)",
+    subtitle = "U-подібна кривизна (неврахована взаємодія) + конусоподібна гетероскедастичність",
+    x = "Прогнозована ціна, млн USD",
+    y = "Залишок, млн USD"
+  )
+```
+
+---
+
+## 5. Порівняння моделей на 5-Fold CV (Train)
+
+```{r slide-cv-table}
+set.seed(42)
+cv_folds <- vfold_cv(train_df, v = 5)
+
+cv_res <- map_dfr(cv_folds$splits, function(split) {
+  tr <- analysis(split)
+  va <- assessment(split)
+  p_const <- rep(mean(tr$Price_USD), nrow(va))
+  p_base  <- predict(lm(formula_base, data = tr), newdata = va)
+  p_inter <- predict(lm(formula_inter, data = tr), newdata = va)
+  tibble(
+    Модель = c(
+      "1. Константний орієнтир (Mean)",
+      "2. Базова регресія (OLS)",
+      "3. OLS + взаємодія (Area * Location)"
+    ),
+    MAE = c(
+      mean(abs(va$Price_USD - p_const)),
+      mean(abs(va$Price_USD - p_base)),
+      mean(abs(va$Price_USD - p_inter))
+    ),
+    RMSE = c(
+      sqrt(mean((va$Price_USD - p_const)^2)),
+      sqrt(mean((va$Price_USD - p_base)^2)),
+      sqrt(mean((va$Price_USD - p_inter)^2))
+    )
+  )
+}) |>
+  group_by(Модель) |>
+  summarise(
+    `MAE (середнє, USD)`  = round(mean(MAE), 0),
+    `MAE (SD)`            = round(sd(MAE), 0),
+    `RMSE (середнє, USD)` = round(mean(RMSE), 0),
+    `RMSE (SD)`           = round(sd(RMSE), 0),
+    .groups = "drop"
+  )
+
+kable(cv_res)
+```
+
+* Додавання взаємодії `Area_sqft * Location` знижує **MAE на $29.6\%$** порівняно з базовою OLS.
+
+---
+
+## 6. Фінальна оцінка на тестовій вибірці ($n = 10\,000$)
+
+```{r slide-test-plot, fig.width=11, fig.height=4.8}
+test_res <- test_df |>
+  mutate(
+    pred_final = predict(fit_inter, newdata = test_df),
+    abs_error  = abs(Price_USD - pred_final)
+  )
+
+set.seed(42)
+test_res |>
+  slice_sample(n = 3000) |>
+  ggplot(aes(x = Price_USD / 1e6, y = pred_final / 1e6)) +
+  geom_point(alpha = 0.25, color = "#16a085") +
+  geom_abline(slope = 1, intercept = 0, color = "#e74c3c", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Фактичні проти прогнозованих цін (Test: MAE = $172 856 | R² = 0.950)",
+    subtitle = "Найбільші абсолютні помилки — у верхньому сегменті (> $3 млн) через мультиплікативний розкид",
+    x = "Фактична ціна (Test), млн USD",
+    y = "Прогнозована ціна, млн USD"
+  )
+```
+
+---
+
+## 7. Висновки та межі узагальнення
+
+* **Обидві гіпотези підтверджено:** площа — головний драйвер ціни ($H_1$), а її гранична вартість відрізняється між містами ($H_2$, $p < 0.001$ з робастними похибками `HC3`).
+* **Якість на нових даних:** $\text{Test MAE} = \$172\,856$ (проти $\$855\,510$ для константи), $R^2_{\text{test}} = 0.950$.
+* **Межі висновків:** оцінки відображають статистичні асоціації для 8 мегаполісів США; у даних відсутні якісні характеристики ремонту та району.
+* **Подальший крок:** застосування **WLS** або **логарифмічної моделі** $\log(\text{Price\_USD})$ для стабілізації дисперсії залишків.
